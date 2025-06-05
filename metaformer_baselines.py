@@ -73,7 +73,7 @@ default_cfgs = {
     'poolformerv2_m48': _cfg(
         url='https://huggingface.co/sail/dl/resolve/main/poolformerv2/poolformerv2_m48.pth'),
 
-
+    'matmulfreeformer_s18': _cfg(),
 
     'convformer_s18': _cfg(
         url='https://huggingface.co/sail/dl/resolve/main/convformer/convformer_s18.pth'),
@@ -384,6 +384,32 @@ class LayerNormWithoutBias(nn.Module):
 # Add RMS Layer norm         #
 ##############################
 
+class RMSNorm(nn.Module):
+    r""" RMS Norm.
+    Root-Mean-Square Layer Norm (Zhang et al., 2019).
+    Equivalent to x / rms(x) * weight.
+    Bias term is optional but usually unnecessary.
+    """
+    def __init__(self, affine_shape=None, normalized_dim=(-1, ), scale=True, 
+        bias=True, eps=1e-5):
+        super().__init__()
+        self.normalized_dim = normalized_dim
+        self.use_scale = scale
+        self.use_bias = bias
+        self.weight = nn.Parameter(torch.ones(affine_shape)) if scale else None
+        self.bias = nn.Parameter(torch.zeros(affine_shape)) if bias else None
+        self.eps = eps
+
+    def forward(self, x):
+
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = x / rms * self.weight
+        if self.use_scale:
+            x = x * self.weight
+        if self.use_bias:
+            x = x + self.bias
+        return x
+    
 ##############################
 # End                        #
 ##############################
@@ -391,6 +417,7 @@ class LayerNormWithoutBias(nn.Module):
 ##############################
 # Add matmulfree token mixer #
 ##############################
+
 def activation_quant(x):
     """
     Per-token quantization to 8 bits. No grouping is needed for quantization.
@@ -489,9 +516,9 @@ class MatMulFree(nn.Module):
         
         self.attention_dim = self.num_heads * self.head_dim
 
-        self.qkv = BitLinear(dim, self.attention_dim * 3, bias=qkv_bias) # Replace nn.Linear with BitLinear
+        self.qkv = BitLinear(dim, self.attention_dim * 3, bias=qkv_bias) # Replaced nn.Linear with BitLinear
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = BitLinear(self.attention_dim, dim, bias=proj_bias) # Replace nn.Linear with BitLinear
+        self.proj = BitLinear(self.attention_dim, dim, bias=proj_bias) # Replaced nn.Linear with BitLinear
         self.proj_drop = nn.Dropout(proj_drop)
 
         
@@ -1033,6 +1060,7 @@ def poolformerv2_m48(pretrained=False, **kwargs):
 ##############################
 # Add MatMulFree models      #
 ##############################
+
 @register_model
 def matmulfreeformer_s18(pretrained=False, **kwargs):
     model = MetaFormer(
@@ -1040,9 +1068,12 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
         dims=[64, 128, 320, 512], 
         token_mixers=MatMulFree, 
         head_fn=MlpHead, 
-        norm_layers = partial(LayerNormGeneral, normalized_dim=(1, 2, 3), eps=1e-6, bias=False), 
+        norm_layers = partial(RMSNorm, normalized_dim=(1, 2, 3), eps=1e-6, bias=False), 
         **kwargs)
     model.default_cfg = default_cfgs['matmulfreeformer_s18']
+    #model.default_cfg = default_cfgs['convformer_s18']
+
+    return model
 
 ##############################
 # End                        #
