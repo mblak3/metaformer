@@ -384,6 +384,7 @@ class LayerNormWithoutBias(nn.Module):
 ##############################
 # Add RMS Layer norm         #
 ##############################
+# 29.9.25 TODO: Looks incorrect, probably needs fixing. Review training result and RMSNorm implementation. 
 
 class RMSNorm(nn.Module):
     r""" RMS Norm.
