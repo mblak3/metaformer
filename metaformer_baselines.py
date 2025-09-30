@@ -74,6 +74,7 @@ default_cfgs = {
         url='https://huggingface.co/sail/dl/resolve/main/poolformerv2/poolformerv2_m48.pth'),
 
     'matmulfreeformer_s18': _cfg(),
+    'baselineformer_s18': _cfg(),
 
     'convformer_s18': _cfg(
         url='https://huggingface.co/sail/dl/resolve/main/convformer/convformer_s18.pth'),
@@ -1071,6 +1072,20 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
         norm_layers = partial(RMSNorm, normalized_dim=(1, 2, 3), eps=1e-6, bias=False), 
         **kwargs)
     model.default_cfg = default_cfgs['matmulfreeformer_s18']
+    #model.default_cfg = default_cfgs['convformer_s18']
+
+    return model
+
+@register_model
+def baselineformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3], 
+        dims=[64, 128, 320, 512], 
+        token_mixers=Attention, 
+        head_fn=MlpHead, 
+        #norm_layers = partial(RMSNorm, normalized_dim=(1, 2, 3), eps=1e-6, bias=False), 
+        **kwargs)
+    model.default_cfg = default_cfgs['baselineformer_s18']
     #model.default_cfg = default_cfgs['convformer_s18']
 
     return model
