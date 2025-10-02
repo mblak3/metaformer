@@ -27,6 +27,7 @@ from timm.models.registry import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers.helpers import to_2tuple
 
+from typing import Optional
 
 def _cfg(url='', **kwargs):
     return {
@@ -190,6 +191,28 @@ default_cfgs = {
         num_classes=21841),
 }
 
+class SeqAdapter(nn.Module):
+    def __init__(self, mixer: nn.Module, layout: str = "NHWC"):
+        super().__init__()
+        assert layout in ("NHWC",), "This adapter is written for NHWC; extend if you need NCHW."
+        self.mixer = mixer
+        self.layout = layout
+
+    def to_seq(self, x):
+        # NHWC -> (B,L,C)
+        B, H, W, C = x.shape
+        return x.reshape(B, H * W, C), (H, W)
+
+    def to_grid(self, x_seq, HW):
+        # (B,L,C) -> NHWC
+        H, W = HW
+        B, L, C = x_seq.shape
+        return x_seq.reshape(B, H, W, C)
+
+    def forward(self, x, *args, **kwargs):
+        x_seq, HW = self.to_seq(x)
+        x_seq = self.mixer(x_seq, *args, **kwargs)  # mixer expects (B,L,dim)
+        return self.to_grid(x_seq, HW)
 
 class Downsampling(nn.Module):
     """
@@ -386,7 +409,7 @@ class LayerNormWithoutBias(nn.Module):
 ##############################
 # 29.9.25 TODO: Looks incorrect, probably needs fixing. Review training result and RMSNorm implementation. 
 
-class RMSNorm(nn.Module):
+class RMSNorm_old(nn.Module):
     r""" RMS Norm.
     Root-Mean-Square Layer Norm (Zhang et al., 2019).
     Equivalent to x / rms(x) * weight.
@@ -411,6 +434,16 @@ class RMSNorm(nn.Module):
         if self.use_bias:
             x = x + self.bias
         return x
+    
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    def forward(self, x):
+        v = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x_hat = x * torch.rsqrt(v + self.eps)
+        return (x_hat * self.weight).type_as(x)
     
 ##############################
 # End                        #
@@ -581,92 +614,84 @@ class MatMulFreeGRU(nn.Module):
         y = self.proj_drop(y)
         y = y.view(B, H, W, C)
         return y
+    
 ##############################
 # New Token mixer ideas      #
 ##############################
 
-from einops import rearrange
+class MinimalHGRNCore(nn.Module):
+    """
+    Minimal, code-faithful core:
+      - i = SiLU(i_proj(x)) * (1 - sigmoid(f_proj(x)))
+      - recurrent scan: s_t = f_t * s_{t-1} + i_t
+      - y_t = SiLU(g_proj(x)) * RMSNorm(s_t)
+      - out_t = o_proj(y_t)
 
-def rms_norm(x, eps=1e-5):
-    # x: (..., E)
-    var = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return x * torch.rsqrt(var + eps)
-
-def swiglu(x, gate):
-    # same 2-arg usage as in your code: swiglu(i, 1-f)
-    return torch.nn.functional.silu(x) * gate
-
-class HGRNRef(nn.Module):
-    def __init__(self, hidden_size, num_heads, expand_ratio=1,
-                 use_short_conv=False, conv_size=4, share_conv_kernel=True,
-                 layernorm_eps=1e-5):
+    No heads, no convs, no cache. Perfect for quick replication tests.
+    """
+    def __init__(self, dim, expand_ratio: int = 1, layernorm_eps: float = 1e-5,
+                 linear_cls=BitLinear, drop: float = 0.0):
         super().__init__()
-        self.H = hidden_size
-        self.h = num_heads
-        self.r = expand_ratio
-        self.E = self.H * self.r
-        assert self.E % self.h == 0
-        self.D = self.E // self.h
-        self.use_short_conv = use_short_conv
-        self.share_conv_kernel = share_conv_kernel
-        self.conv_size = conv_size
-        # linear projections (replace BitLinear)
-        self.i_proj = nn.Linear(self.H, self.E, bias=False)
-        self.f_proj = nn.Linear(self.H, self.E, bias=False)
-        self.g_proj = nn.Linear(self.H, self.E, bias=False)
-        if use_short_conv:
-            if share_conv_kernel:
-                self.h_conv = nn.Conv1d(self.H, self.H, conv_size, groups=self.H, padding=conv_size-1, bias=False)
-            else:
-                self.i_conv = nn.Conv1d(self.E, self.E, conv_size, groups=self.E, padding=conv_size-1, bias=False)
-                self.f_conv = nn.Conv1d(self.E, self.E, conv_size, groups=self.E, padding=conv_size-1, bias=False)
-        self.layernorm_eps = layernorm_eps
-        self.o_proj = nn.Linear(self.E, self.H, bias=False)
+        H, E = dim, dim * expand_ratio
+        self.H, self.E = H, E
+        self.drop = float(drop) # kept for backwards compatibility; not used
 
-    def forward(self, hidden_states, attention_mask=None, lower_bound=None, layer_idx=0):
-        B, L, H = hidden_states.shape
-        x = hidden_states
-        # short conv (very rough depthwise approx)
-        if self.use_short_conv and self.share_conv_kernel:
-            xc = self.h_conv(x.transpose(1,2))[:, :, :L].transpose(1,2)
-            i = self.i_proj(xc)
-            f = self.f_proj(xc)
-        elif self.use_short_conv:
-            i = self.i_proj(x)
-            f = self.f_proj(x)
-            i = self.i_conv(i.transpose(1,2))[:, :, :L].transpose(1,2)
-            f = self.f_conv(f.transpose(1,2))[:, :, :L].transpose(1,2)
-        else:
-            i = self.i_proj(x)
-            f = self.f_proj(x)
+        self.i_proj = linear_cls(H, E, bias=False)
+        self.f_proj = linear_cls(H, E, bias=False)
+        self.g_proj = linear_cls(H, E, bias=False)
+        self.o_proj = linear_cls(E, H, bias=False)
 
-        f = torch.sigmoid(f)
+        self.rms = RMSNorm(E, eps=layernorm_eps)
+
+        # Mild init; replace if you need exact parity with your repo
+        for m in [self.i_proj, self.f_proj, self.g_proj, self.o_proj]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
+
+    def forward(self, x, attention_mask=None, lower_bound=None, layer_idx: int = 0):
+        """
+        x: (B, L, H)
+        attention_mask: (B, L) or None — masks innovation only
+        lower_bound: scalar or tensor broadcastable to (B, L, E); applied to f if layer_idx>0
+        """
+
+        #print("x shape BEFORE MinimalHGRNCore:", tuple(x.shape))
+
+        B, L, H = x.shape
+        E = self.E
+
+        # Projections
+        i = self.i_proj(x)          # (B,L,E)
+        f = torch.sigmoid(self.f_proj(x))  # (B,L,E)
+
+        # Optional lower-bound toward 1 (stabilizes deep stacks)
         if lower_bound is not None and layer_idx > 0:
             f = lower_bound + (1 - lower_bound) * f
 
-        i = swiglu(i, 1 - f)
+        # Innovation shaped by (1 - f)
+        i = F.silu(i) * (1.0 - f)
+
+        # Mask innovation (left padding): padded tokens don’t update state
         if attention_mask is not None:
-            i = i * attention_mask.unsqueeze(-1)
+            if attention_mask.dim() == 2:
+                mask = attention_mask.unsqueeze(-1)  # (B,L,1)
+            elif attention_mask.dim() == 3:          # (B,1,L)
+                mask = attention_mask.transpose(1,2).unsqueeze(-1)
+            else:
+                raise ValueError("attention_mask must be (B,L) or (B,1,L)")
+            i = i * mask
 
-        i = rearrange(i, 'b l (h d) -> b h l d', h=self.h)
-        f = rearrange(f, 'b l (h d) -> b h l d', h=self.h)
-
-        # recurrent scan: s_t = f_t * s_{t-1} + i_t
-        s = torch.zeros(B, self.h, self.D, device=i.device, dtype=i.dtype)
+        # Recurrent scan over time (vectorized loop)
+        s = x.new_zeros(B, E)  # per-batch state
         outs = []
-        for t in range(i.size(2)):
-            s = f[:,:,t,:] * s + i[:,:,t,:]
-            outs.append(s)
-        o = torch.stack(outs, dim=2)  # (B,h,L,D)
+        for t in range(L):
+            s = f[:, t, :] * s + i[:, t, :]
+            # Fused gate (code-faithful): SiLU(g_logits) * RMSNorm(s)
+            g_logits_t = self.g_proj(x[:, t, :])      # (B,E)
+            y_t = F.silu(g_logits_t) * self.rms(s)    # (B,E)
+            outs.append(self.o_proj(y_t))             # (B,H)
 
-        o_merged = rearrange(o, 'b h l d -> b l (h d)')
-        g_logits = self.g_proj(x)
-        # FusedRMSNormSwishGate approximation:
-        y = torch.nn.functional.silu(g_logits) * rms_norm(o_merged, self.layernorm_eps)
-
-        out = self.o_proj(y)
-        return out
-
+        return torch.stack(outs, dim=1)  # (B,L,H)
 
 ##############################
 # End                        #
@@ -751,10 +776,10 @@ class MlpHead(nn.Module):
         norm_layer=nn.LayerNorm, head_dropout=0., bias=True):
         super().__init__()
         hidden_features = int(mlp_ratio * dim)
-        self.fc1 = BitLinear(dim, hidden_features, bias=bias) # Replaced nn.Linear with BitLinear
+        self.fc1 = nn.Linear(dim, hidden_features, bias=bias) 
         self.act = act_layer()
         self.norm = norm_layer(hidden_features)
-        self.fc2 = BitLinear(hidden_features, num_classes, bias=bias) # Replaced nn.Linear with BitLinear
+        self.fc2 = nn.Linear(hidden_features, num_classes, bias=bias)
         self.head_dropout = nn.Dropout(head_dropout)
 
 
@@ -770,49 +795,57 @@ class MlpHead(nn.Module):
 # matmulfree channel mixer   #
 ##############################
 
-class MatMulFreeGLU(nn.Module):
+class MinimalHGRNChannelMixer(nn.Module):
     """
-    MLP replaced with a GLU-style FFN:
-      x -> Linear(dim -> 2*hidden) -> split -> value * gate(value_2) -> Dropout -> Linear(hidden -> out) -> Dropout
-    gate_fn in {"sigmoid","gelu","silu","relu"} gives GLU / GEGLU / SwiGLU / ReGLU respectively.
+    Minimal, code-faithful channel mixer (GLU-like):
+      gate, y = split( GateProj(x) )
+      z = SwiGLU(gate, y)      # ≈ SiLU(gate) * y
+      out = DownProj(z)
+
+    - No dropout, no norms, no extras.
+    - 'drop' kept for backward-compat but unused.
     """
-    def __init__(self, dim, mlp_ratio=4, out_features=None, gate_fn: str = "silu", drop=0.,bias=False, **kwargs):
+
+    def __init__(self, dim: int, hidden_ratio: Optional[int] = 4, intermediate_size: Optional[int] = None,
+        hidden_act: str = "swish", linear_cls = BitLinear, drop: float = 0.0):
         super().__init__()
-        in_features = dim
-        out_features = out_features or in_features
-        hidden_features = int(mlp_ratio * in_features)
-        drop_probs = to_2tuple(drop)
+        self.dim = dim
+        self.drop = float(drop)             # kept for BC
+        # Match defaults/logic from the original:
+        if hidden_ratio is None:
+            hidden_ratio = 4
+        if intermediate_size is None:
+            inter = int(dim * hidden_ratio * 2 / 3)
+            # round up to nearest multiple of 256
+            intermediate_size = 256 * ((inter + 256 - 1) // 256)
 
-        # one projection to produce both the value and the gate pre-activations
-        self.in_proj  = nn.Linear(in_features, 2 * hidden_features, bias=bias)
-        self.drop1    = nn.Dropout(drop_probs[0])
-        self.out_proj = nn.Linear(hidden_features, out_features, bias=bias)
-        self.drop2    = nn.Dropout(drop_probs[1])
+        self.hidden_ratio = hidden_ratio
+        self.intermediate_size = intermediate_size
 
-        gate_fn = gate_fn.lower()
-        if gate_fn not in {"sigmoid", "gelu", "silu", "relu"}:
-            raise ValueError(f"Unsupported gate_fn: {gate_fn}")
-        self.gate_fn = gate_fn
+        # GateProj produces 2 * intermediate_size, then we split
+        self.gate_proj = linear_cls(dim, 2 * intermediate_size, bias=False)
+        self.down_proj = linear_cls(intermediate_size, dim, bias=False)
 
-    def _gate(self, x):
-        if self.gate_fn == "sigmoid":  # GLU
-            return torch.sigmoid(x)
-        if self.gate_fn == "gelu":     # GEGLU
-            return F.gelu(x)
-        if self.gate_fn == "silu":     # SwiGLU
-            return F.silu(x)
-        if self.gate_fn == "relu":     # ReGLU
-            return F.relu(x)
+        # Mild init (same spirit as before; swap if you need exact repo init)
+        for m in [self.gate_proj, self.down_proj]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
 
-    def forward(self, x):
-        # x: (..., dim) e.g. (B, N, C); Linear acts on last dim just like your Mlp
-        v, g = self.in_proj(x).chunk(2, dim=-1)  # value & gate pre-activations
-        x = v * self._gate(g)                    # gated features
-        x = self.drop1(x)
-        x = self.out_proj(x)
-        x = self.drop2(x)
-        return x
+    @staticmethod
+    def _swiglu(gate: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # Same structure used in the repo: swiglu(gate, y) = SiLU(gate) * y
+        return F.silu(gate) * y
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, L, dim)
+        returns: (B, L, dim)
+        """
+        h = self.gate_proj(x)                        # (B,L,2*I)
+        gate, y = h.chunk(2, dim=-1)                # (B,L,I), (B,L,I)
+        z = self._swiglu(gate, y)                   # (B,L,I)
+        out = self.down_proj(z)                     # (B,L,dim)
+        return out
 
 ##############################
 # End                        #
@@ -832,7 +865,7 @@ class MetaFormerBlock(nn.Module):
         super().__init__()
 
         self.norm1 = norm_layer(dim) # self.attn_norm = RMSNorm
-        self.token_mixer = token_mixer(dim=dim, drop=drop) # self.attn = HGRNBitAttention
+        self.token_mixer = SeqAdapter(token_mixer(dim=dim, drop=drop), layout="NHWC") # self.attn = HGRNBitAttention
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() # what is drop_path1?
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -840,7 +873,7 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         self.norm2 = norm_layer(dim) # self.mlp_norm = RMSNorm
-        self.mlp = mlp(dim=dim, drop=drop) # self.mlp = HGRNBitMLP
+        self.mlp = SeqAdapter(mlp(dim=dim, drop=drop), "NHWC") # self.mlp = HGRNBitMLP
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -1248,9 +1281,10 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
     model = MetaFormer(
         depths=[3, 3, 9, 3], 
         dims=[64, 128, 320, 512], 
-        token_mixers=MatMulFree, 
+        token_mixers=MinimalHGRNCore, 
+        mlp=MinimalHGRNChannelMixer,
         head_fn=MlpHead, 
-        norm_layers = partial(RMSNorm, normalized_dim=(1, 2, 3), eps=1e-6, bias=False), 
+        norm_layers = partial(RMSNorm, eps=1e-6), 
         **kwargs)
     model.default_cfg = default_cfgs['matmulfreeformer_s18']
     #model.default_cfg = default_cfgs['convformer_s18']
