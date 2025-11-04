@@ -627,7 +627,7 @@ class MinimalHGRNCore(nn.Module):
       - y_t = SiLU(g_proj(x)) * RMSNorm(s_t)
       - out_t = o_proj(y_t)
 
-    No heads, no convs, no cache. Perfect for quick replication tests.
+    No heads, no convs, no cache. 
     """
     def __init__(self, dim, expand_ratio: int = 1, layernorm_eps: float = 1e-5,
                  linear_cls=BitLinear, drop: float = 0.0):
@@ -681,7 +681,7 @@ class MinimalHGRNCore(nn.Module):
                 raise ValueError("attention_mask must be (B,L) or (B,1,L)")
             i = i * mask
 
-        # Recurrent scan over time (vectorized loop)
+        """ # Recurrent scan over time (vectorized loop)
         s = x.new_zeros(B, E)  # per-batch state
         outs = []
         for t in range(L):
@@ -691,7 +691,20 @@ class MinimalHGRNCore(nn.Module):
             y_t = F.silu(g_logits_t) * self.rms(s)    # (B,E)
             outs.append(self.o_proj(y_t))             # (B,H)
 
-        return torch.stack(outs, dim=1)  # (B,L,H)
+        return torch.stack(outs, dim=1)  # (B,L,H) """
+
+        # --- Recurrent scan (vectorized) ---
+        # s_t = f_t * s_{t-1} + i_t with s0 = 0
+        prefix = torch.cumprod(f, dim=1)                                  # (B,L,E)
+        denom  = torch.cat([torch.ones_like(prefix[:, :1]), prefix[:, :-1]], dim=1)
+        s = prefix * torch.cumsum(i / denom.clamp_min(1e-8), dim=1)       # (B,L,E)
+
+        # Output gate path
+        g_logits = self.g_proj(x)                # (B,L,E)
+        y = F.silu(g_logits) * self.rms(s)       # (B,L,E)
+        out = self.o_proj(y)                     # (B,L,dim)
+        return out
+
 
 ##############################
 # End                        #
@@ -773,13 +786,13 @@ class MlpHead(nn.Module):
     """ MLP classification head
     """
     def __init__(self, dim, num_classes=1000, mlp_ratio=4, act_layer=SquaredReLU,
-        norm_layer=nn.LayerNorm, head_dropout=0., bias=True):
+        norm_layer=RMSNorm, head_dropout=0., bias=True): # replaced nn.LayerNorm with RMSNorm
         super().__init__()
         hidden_features = int(mlp_ratio * dim)
-        self.fc1 = nn.Linear(dim, hidden_features, bias=bias) 
+        self.fc1 = BitLinear(dim, hidden_features, bias=bias) # Replaced nn.Linear with BitLinear
         self.act = act_layer()
         self.norm = norm_layer(hidden_features)
-        self.fc2 = nn.Linear(hidden_features, num_classes, bias=bias)
+        self.fc2 = BitLinear(hidden_features, num_classes, bias=bias) # Replaced nn.Linear with BitLinear
         self.head_dropout = nn.Dropout(head_dropout)
 
 
@@ -864,16 +877,16 @@ class MetaFormerBlock(nn.Module):
 
         super().__init__()
 
-        self.norm1 = norm_layer(dim) # self.attn_norm = RMSNorm
-        self.token_mixer = SeqAdapter(token_mixer(dim=dim, drop=drop), layout="NHWC") # self.attn = HGRNBitAttention
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() # what is drop_path1?
+        self.norm1 = norm_layer(dim) 
+        self.token_mixer = SeqAdapter(token_mixer(dim=dim, drop=drop), layout="NHWC") 
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
         self.res_scale1 = Scale(dim=dim, init_value=res_scale_init_value) \
             if res_scale_init_value else nn.Identity()
 
-        self.norm2 = norm_layer(dim) # self.mlp_norm = RMSNorm
-        self.mlp = SeqAdapter(mlp(dim=dim, drop=drop), "NHWC") # self.mlp = HGRNBitMLP
+        self.norm2 = norm_layer(dim) 
+        self.mlp = SeqAdapter(mlp(dim=dim, drop=drop), "NHWC") 
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -893,6 +906,10 @@ class MetaFormerBlock(nn.Module):
                     self.mlp(self.norm2(x))
                 )
             )
+        """ x = self.token_mixer(self.norm1(x))
+
+        x = self.mlp(self.norm2(x)) """
+
         return x
 
 
