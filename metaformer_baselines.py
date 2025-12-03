@@ -22,12 +22,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import rearrange
+# Added Cache, what does it do?
+from transformers.cache_utils import Cache
+
+# need to implement this, probably triton
+#from mmfreelm.modules.activations import swiglu
+
 from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers.helpers import to_2tuple
 
-from typing import Optional
+#Added Tuple
+from typing import Optional, Tuple
 
 def _cfg(url='', **kwargs):
     return {
@@ -530,6 +538,9 @@ class BitLinear(nn.Linear):
 
         return y
 
+##############################
+# Old ideas, to be removed   #
+##############################
 # MatMulFreeAttn 
 class MatMulFree(nn.Module):
     """def __init__():
@@ -616,7 +627,105 @@ class MatMulFreeGRU(nn.Module):
         return y
     
 ##############################
-# New Token mixer ideas      #
+# End                        #
+##############################
+
+##############################
+# New MMFGRU (WIP)           #
+##############################
+
+class MatMulFreeGRU(nn.Module):
+    """
+
+    """
+    # Remove head_dim, num_heads, qkv_bias ?
+    # Add expand_ratio ?
+    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+        attn_drop=0., proj_drop=0., proj_bias=False, layer_idx: int = None, **kwargs):
+        super().__init__()
+
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+
+        self.num_heads = num_heads if num_heads else dim // head_dim
+        if self.num_heads == 0:
+            self.num_heads = 1
+        
+        # attention_dim is for attention, no equivalent here
+        #self.attention_dim = self.num_heads * self.head_dim
+
+        # input_dim is the name used, but this is actually the out_features...
+        self.input_dim = int(dim * 1)
+
+        # layer_idx, I have no idea what this does 
+        # ok, this is passed from HGRNBitModel, into Block, into Attention. The value comes from num_hidden_layers
+        # in the parameter file. I do not know what the value should be for our case however. 
+        self.layer_idx = layer_idx
+
+        # hidden_size | dim
+        # input_dim = hidden_size * expand_ratio | attention_dim = dim * ??? 1?
+        self.i_proj = BitLinear(dim, self.input_dim, bias=False)
+        self.i_proj = BitLinear(dim, self.input_dim, bias=False)
+        self.g_proj = BitLinear(dim, self.input_dim, bias=False)
+
+        # short_conv goes here, but short_conv is set to false so this should never be run...
+
+        # FusedRMSNormSwishGate
+        self.g_norm = RMSNorm(self.input_dim, 1e-5)
+        self.o_proj = BitLinear(self.input_dim, dim, bias=False)
+
+        # weights are initialized here. Don't know if this needs to be added yet 
+        
+    def forward(self, 
+                x, 
+                attention_mask: Optional[torch.Tensor] = None, 
+                past_key_values: Optional[Cache] = None, 
+                use_cache: Optional[bool] = False, 
+                output_attentions: Optional[bool] = False, 
+                lower_bound: Optional[torch.Tensor] = None,
+                **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        # This is the triton code
+        mode = 'fused_recurrent' if x.shape[1] == 1 else self.mode
+
+        last_state = past_key_values[self.layer_idx] if use_cache else None
+
+        i = self.i_proj(x)
+        f = self.f_proj(x)
+
+        f = f.sigmoid() # how does this work
+
+        if lower_bound is not None and self.layer_idx > 0:
+            f = lower_bound + (1 - lower_bound) * F
+        i = swiglu(i, 1 - f) # need to implement 
+
+        # "dealing with left-padding" what does this mean
+        if attention_mask is not None:
+            i = i.mul_(attention_mask.unsqueeze(-1))
+        i, f = map(lambda x: rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads), (i, f)) # lmao what does this do
+
+        recurrent_state = last_state[-1] if use_cache else None
+
+        # This is the second part of the triton code
+        if mode == 'fused_recurrent':
+            o, recurrent_state = fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
+        else:
+            raise NotImplementedError(f"Not supported mode `{mode}`.")
+        
+        if past_key_values is not None:
+            last_state = (recurrent_state,)
+            past_key_values.update(last_state, self.layer_idx, i.shape[2]) # is this shape correct?
+
+        o = self.g_norm(self.g_proj(x), rearrange(o, 'b h l d -> b l (h d)'))
+        o = self.o_proj(o)
+
+        return o, None, past_key_values
+
+##############################
+# End                        #
+##############################
+
+##############################
+# Current Token mixer idea   #
 ##############################
 
 class MinimalHGRNCore(nn.Module):
@@ -894,6 +1003,15 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
         
     def forward(self, x):
+        # TODO:
+        # residual = hidden_states (or in this case, x)
+        # hidden_states = self.attn_norm(hidden_states)
+        # hidden_states, attentions, past_key_values = self.attn(hidden_states = hidden_states, 
+        #                                                        attention_mask = attention_mask, 
+        #                                                        past_key_values = past_key_values,
+        #                                                        use_cache = use_cache, 
+        #                                                        output_attentions = output_attentions, 
+        #                                                        lower_bound = lower_bound)
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
@@ -906,10 +1024,12 @@ class MetaFormerBlock(nn.Module):
                     self.mlp(self.norm2(x))
                 )
             )
-        """ x = self.token_mixer(self.norm1(x))
+        # hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        # hidden_states = self.mlp(hidden_states)
+        # hidden_states = residual + hidden_states
 
-        x = self.mlp(self.norm2(x)) """
-
+        # outputs = (hidden_states, attentions, past_key_values)
+        # return outputs
         return x
 
 
