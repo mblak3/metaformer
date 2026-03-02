@@ -22,6 +22,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+#For Triton code
+import recurrent_fuse
+
+import activations
+
+import fused_norm_gate
+
+import layernorm
+
 from einops import rearrange
 # Added Cache, what does it do?
 from transformers.cache_utils import Cache
@@ -214,7 +223,7 @@ class SeqAdapter(nn.Module):
     def to_grid(self, x_seq, HW):
         # (B,L,C) -> NHWC
         H, W = HW
-        B, L, C = x_seq.shape
+        B, L, C = x_seq.shape  # This is where the error is 13/02/2026
         return x_seq.reshape(B, H, W, C)
 
     def forward(self, x, *args, **kwargs):
@@ -443,15 +452,15 @@ class RMSNorm_old(nn.Module):
             x = x + self.bias
         return x
     
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-    def forward(self, x):
-        v = x.float().pow(2).mean(dim=-1, keepdim=True)
-        x_hat = x * torch.rsqrt(v + self.eps)
-        return (x_hat * self.weight).type_as(x)
+# class RMSNorm(nn.Module):
+#     def __init__(self, dim: int, eps: float = 1e-5):
+#         super().__init__()
+#         self.eps = eps
+#         self.weight = nn.Parameter(torch.ones(dim))
+#     def forward(self, x):
+#         v = x.float().pow(2).mean(dim=-1, keepdim=True)
+#         x_hat = x * torch.rsqrt(v + self.eps)
+#         return (x_hat * self.weight).type_as(x)
     
 ##############################
 # End                        #
@@ -511,7 +520,7 @@ class BitLinear(nn.Linear):
         """
         # Initialize the superclass nn.Linear with the given parameters
         super(BitLinear, self).__init__(in_features, out_features, bias=bias)
-        self.norm = RMSNorm(in_features, eps=1e-8)
+        self.norm = layernorm.RMSNorm(in_features, eps=1e-8)
 
     def forward(self, x):
         """
@@ -542,89 +551,89 @@ class BitLinear(nn.Linear):
 # Old ideas, to be removed   #
 ##############################
 # MatMulFreeAttn 
-class MatMulFree(nn.Module):
-    """def __init__():
-        super().__init__()
+# class MatMulFree(nn.Module):
+#     """def __init__():
+#         super().__init__()
 
-    def forward(self, x):
+#     def forward(self, x):
 
-        return x"""
+#         return x"""
     
-    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
-        attn_drop=0., proj_drop=0., proj_bias=False, **kwargs):
-        super().__init__()
+#     def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+#         attn_drop=0., proj_drop=0., proj_bias=False, **kwargs):
+#         super().__init__()
 
-        self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
+#         self.head_dim = head_dim
+#         self.scale = head_dim ** -0.5
 
-        self.num_heads = num_heads if num_heads else dim // head_dim
-        if self.num_heads == 0:
-            self.num_heads = 1
+#         self.num_heads = num_heads if num_heads else dim // head_dim
+#         if self.num_heads == 0:
+#             self.num_heads = 1
         
-        self.attention_dim = self.num_heads * self.head_dim
+#         self.attention_dim = self.num_heads * self.head_dim
 
-        self.qkv = BitLinear(dim, self.attention_dim * 3, bias=qkv_bias) # Replaced nn.Linear with BitLinear
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = BitLinear(self.attention_dim, dim, bias=proj_bias) # Replaced nn.Linear with BitLinear
-        self.proj_drop = nn.Dropout(proj_drop)
+#         self.qkv = BitLinear(dim, self.attention_dim * 3, bias=qkv_bias) # Replaced nn.Linear with BitLinear
+#         self.attn_drop = nn.Dropout(attn_drop)
+#         self.proj = BitLinear(self.attention_dim, dim, bias=proj_bias) # Replaced nn.Linear with BitLinear
+#         self.proj_drop = nn.Dropout(proj_drop)
 
         
-    def forward(self, x):
-        B, H, W, C = x.shape
-        N = H * W
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+#     def forward(self, x):
+#         B, H, W, C = x.shape
+#         N = H * W
+#         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+#         q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+#         attn = (q @ k.transpose(-2, -1)) * self.scale
+#         attn = attn.softmax(dim=-1)
+#         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.attention_dim)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+#         x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.attention_dim)
+#         x = self.proj(x)
+#         x = self.proj_drop(x)
+#         return x
     
-# Matmul-free GRU to act as a token mixer   
-class MatMulFreeGRU(nn.Module):
-    """
-    Single-layer GRU unrolled across N tokens with fused input projections.
-    Keeps a final proj + dropout to mirror Attention.
-    """
-    def __init__(self, dim, proj_drop=0.0, bias=True, proj_bias=False, **kwargs):
-        super().__init__()
-        self.dim = dim
-        # x projections (z, r, n)
-        self.x_proj = nn.Linear(dim, 3 * dim, bias=bias)
-        # h projections (z, r, n)
-        self.h_proj = nn.Linear(dim, 3 * dim, bias=bias)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
+# # Matmul-free GRU to act as a token mixer   
+# class MatMulFreeGRU(nn.Module):
+#     """
+#     Single-layer GRU unrolled across N tokens with fused input projections.
+#     Keeps a final proj + dropout to mirror Attention.
+#     """
+#     def __init__(self, dim, proj_drop=0.0, bias=True, proj_bias=False, **kwargs):
+#         super().__init__()
+#         self.dim = dim
+#         # x projections (z, r, n)
+#         self.x_proj = nn.Linear(dim, 3 * dim, bias=bias)
+#         # h projections (z, r, n)
+#         self.h_proj = nn.Linear(dim, 3 * dim, bias=bias)
+#         self.proj = nn.Linear(dim, dim, bias=proj_bias)
+#         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
-        B, H, W, C = x.shape
-        N = H * W
-        seq = x.view(B, N, C)
+#     def forward(self, x):
+#         B, H, W, C = x.shape
+#         N = H * W
+#         seq = x.view(B, N, C)
 
-        h = torch.zeros(B, C, device=seq.device, dtype=seq.dtype)
-        outs = []
-        for t in range(N):
-            xt = seq[:, t, :]
-            x_zrn = self.x_proj(xt)
-            h_zrn = self.h_proj(h)
-            x_z, x_r, x_n = x_zrn.chunk(3, dim=-1)
-            h_z, h_r, h_n = h_zrn.chunk(3, dim=-1)
+#         h = torch.zeros(B, C, device=seq.device, dtype=seq.dtype)
+#         outs = []
+#         for t in range(N):
+#             xt = seq[:, t, :]
+#             x_zrn = self.x_proj(xt)
+#             h_zrn = self.h_proj(h)
+#             x_z, x_r, x_n = x_zrn.chunk(3, dim=-1)
+#             h_z, h_r, h_n = h_zrn.chunk(3, dim=-1)
 
-            z = torch.sigmoid(x_z + h_z)
-            r = torch.sigmoid(x_r + h_r)
-            n = torch.tanh(x_n + r * h_n)
-            h = (1 - z) * n + z * h
-            outs.append(h)
+#             z = torch.sigmoid(x_z + h_z)
+#             r = torch.sigmoid(x_r + h_r)
+#             n = torch.tanh(x_n + r * h_n)
+#             h = (1 - z) * n + z * h
+#             outs.append(h)
 
-        y = torch.stack(outs, dim=1)  # (B, N, C)
-        y = self.proj(y)
-        y = self.proj_drop(y)
-        y = y.view(B, H, W, C)
-        return y
+#         y = torch.stack(outs, dim=1)  # (B, N, C)
+#         y = self.proj(y)
+#         y = self.proj_drop(y)
+#         y = y.view(B, H, W, C)
+#         return y
     
 ##############################
 # End                        #
@@ -640,9 +649,12 @@ class MatMulFreeGRU(nn.Module):
     """
     # Remove head_dim, num_heads, qkv_bias ?
     # Add expand_ratio ?
-    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False, mode: str = 'fused_recurrent',
         attn_drop=0., proj_drop=0., proj_bias=False, layer_idx: int = None, **kwargs):
         super().__init__()
+
+        self.mode = mode
+        self.dim = dim
 
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
@@ -662,16 +674,21 @@ class MatMulFreeGRU(nn.Module):
         # in the parameter file. I do not know what the value should be for our case however. 
         self.layer_idx = layer_idx
 
+        # triton mode? 
+        assert mode in ['fused_recurrent'], f"Not suppoerted mode `{mode}`."
+        #assert self.dim % num_heads == 0, f"hidden size must be divisible by num_heads of {num_heads}"
+
+
         # hidden_size | dim
         # input_dim = hidden_size * expand_ratio | attention_dim = dim * ??? 1?
         self.i_proj = BitLinear(dim, self.input_dim, bias=False)
-        self.i_proj = BitLinear(dim, self.input_dim, bias=False)
+        self.f_proj = BitLinear(dim, self.input_dim, bias=False)
         self.g_proj = BitLinear(dim, self.input_dim, bias=False)
 
         # short_conv goes here, but short_conv is set to false so this should never be run...
 
         # FusedRMSNormSwishGate
-        self.g_norm = RMSNorm(self.input_dim, 1e-5)
+        self.g_norm = fused_norm_gate.FusedRMSNormSwishGate(self.input_dim, 1e-5) # This is using old RMSNorm, needs to be updated to FusedRMSNormSwishGate. 12/02/2026
         self.o_proj = BitLinear(self.input_dim, dim, bias=False)
 
         # weights are initialized here. Don't know if this needs to be added yet 
@@ -683,7 +700,7 @@ class MatMulFreeGRU(nn.Module):
                 use_cache: Optional[bool] = False, 
                 output_attentions: Optional[bool] = False, 
                 lower_bound: Optional[torch.Tensor] = None,
-                **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+                **kwargs): # -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         # This is the triton code
         mode = 'fused_recurrent' if x.shape[1] == 1 else self.mode
 
@@ -696,18 +713,21 @@ class MatMulFreeGRU(nn.Module):
 
         if lower_bound is not None and self.layer_idx > 0:
             f = lower_bound + (1 - lower_bound) * F
-        i = swiglu(i, 1 - f) # need to implement 
+        i = activations.swiglu(i, 1 - f) # need to implement 
+
+        #print("i shape:", i.shape)
+        #print("f shape:", f.shape)
 
         # "dealing with left-padding" what does this mean
         if attention_mask is not None:
             i = i.mul_(attention_mask.unsqueeze(-1))
-        i, f = map(lambda x: rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads), (i, f)) # lmao what does this do
+        i, f = map(lambda x: rearrange(x, 'b H W (h d) -> b h (H W) d', h=self.num_heads), (i, f)) # lmao what does this do
 
         recurrent_state = last_state[-1] if use_cache else None
 
         # This is the second part of the triton code
         if mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
+            o, recurrent_state = recurrent_fuse.fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
         
@@ -715,10 +735,12 @@ class MatMulFreeGRU(nn.Module):
             last_state = (recurrent_state,)
             past_key_values.update(last_state, self.layer_idx, i.shape[2]) # is this shape correct?
 
+        #print("o shape:", o.shape)
+
         o = self.g_norm(self.g_proj(x), rearrange(o, 'b h l d -> b l (h d)'))
         o = self.o_proj(o)
 
-        return o, None, past_key_values
+        return o  #, None, past_key_values
 
 ##############################
 # End                        #
@@ -728,91 +750,91 @@ class MatMulFreeGRU(nn.Module):
 # Current Token mixer idea   #
 ##############################
 
-class MinimalHGRNCore(nn.Module):
-    """
-    Minimal, code-faithful core:
-      - i = SiLU(i_proj(x)) * (1 - sigmoid(f_proj(x)))
-      - recurrent scan: s_t = f_t * s_{t-1} + i_t
-      - y_t = SiLU(g_proj(x)) * RMSNorm(s_t)
-      - out_t = o_proj(y_t)
+# class MinimalHGRNCore(nn.Module):
+#     """
+#     Minimal, code-faithful core:
+#       - i = SiLU(i_proj(x)) * (1 - sigmoid(f_proj(x)))
+#       - recurrent scan: s_t = f_t * s_{t-1} + i_t
+#       - y_t = SiLU(g_proj(x)) * RMSNorm(s_t)
+#       - out_t = o_proj(y_t)
 
-    No heads, no convs, no cache. 
-    """
-    def __init__(self, dim, expand_ratio: int = 1, layernorm_eps: float = 1e-5,
-                 linear_cls=BitLinear, drop: float = 0.0):
-        super().__init__()
-        H, E = dim, dim * expand_ratio
-        self.H, self.E = H, E
-        self.drop = float(drop) # kept for backwards compatibility; not used
+#     No heads, no convs, no cache. 
+#     """
+#     def __init__(self, dim, expand_ratio: int = 1, layernorm_eps: float = 1e-5,
+#                  linear_cls=BitLinear, drop: float = 0.0):
+#         super().__init__()
+#         H, E = dim, dim * expand_ratio
+#         self.H, self.E = H, E
+#         self.drop = float(drop) # kept for backwards compatibility; not used
 
-        self.i_proj = linear_cls(H, E, bias=False)
-        self.f_proj = linear_cls(H, E, bias=False)
-        self.g_proj = linear_cls(H, E, bias=False)
-        self.o_proj = linear_cls(E, H, bias=False)
+#         self.i_proj = linear_cls(H, E, bias=False)
+#         self.f_proj = linear_cls(H, E, bias=False)
+#         self.g_proj = linear_cls(H, E, bias=False)
+#         self.o_proj = linear_cls(E, H, bias=False)
 
-        self.rms = RMSNorm(E, eps=layernorm_eps)
+#         self.rms = RMSNorm(E, eps=layernorm_eps)
 
-        # Mild init; replace if you need exact parity with your repo
-        for m in [self.i_proj, self.f_proj, self.g_proj, self.o_proj]:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
+#         # Mild init; replace if you need exact parity with your repo
+#         for m in [self.i_proj, self.f_proj, self.g_proj, self.o_proj]:
+#             if isinstance(m, nn.Linear):
+#                 nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
 
-    def forward(self, x, attention_mask=None, lower_bound=None, layer_idx: int = 0):
-        """
-        x: (B, L, H)
-        attention_mask: (B, L) or None — masks innovation only
-        lower_bound: scalar or tensor broadcastable to (B, L, E); applied to f if layer_idx>0
-        """
+#     def forward(self, x, attention_mask=None, lower_bound=None, layer_idx: int = 0):
+#         """
+#         x: (B, L, H)
+#         attention_mask: (B, L) or None — masks innovation only
+#         lower_bound: scalar or tensor broadcastable to (B, L, E); applied to f if layer_idx>0
+#         """
 
-        #print("x shape BEFORE MinimalHGRNCore:", tuple(x.shape))
+#         #print("x shape BEFORE MinimalHGRNCore:", tuple(x.shape))
 
-        B, L, H = x.shape
-        E = self.E
+#         B, L, H = x.shape
+#         E = self.E
 
-        # Projections
-        i = self.i_proj(x)          # (B,L,E)
-        f = torch.sigmoid(self.f_proj(x))  # (B,L,E)
+#         # Projections
+#         i = self.i_proj(x)          # (B,L,E)
+#         f = torch.sigmoid(self.f_proj(x))  # (B,L,E)
 
-        # Optional lower-bound toward 1 (stabilizes deep stacks)
-        if lower_bound is not None and layer_idx > 0:
-            f = lower_bound + (1 - lower_bound) * f
+#         # Optional lower-bound toward 1 (stabilizes deep stacks)
+#         if lower_bound is not None and layer_idx > 0:
+#             f = lower_bound + (1 - lower_bound) * f
 
-        # Innovation shaped by (1 - f)
-        i = F.silu(i) * (1.0 - f)
+#         # Innovation shaped by (1 - f)
+#         i = F.silu(i) * (1.0 - f)
 
-        # Mask innovation (left padding): padded tokens don’t update state
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                mask = attention_mask.unsqueeze(-1)  # (B,L,1)
-            elif attention_mask.dim() == 3:          # (B,1,L)
-                mask = attention_mask.transpose(1,2).unsqueeze(-1)
-            else:
-                raise ValueError("attention_mask must be (B,L) or (B,1,L)")
-            i = i * mask
+#         # Mask innovation (left padding): padded tokens don’t update state
+#         if attention_mask is not None:
+#             if attention_mask.dim() == 2:
+#                 mask = attention_mask.unsqueeze(-1)  # (B,L,1)
+#             elif attention_mask.dim() == 3:          # (B,1,L)
+#                 mask = attention_mask.transpose(1,2).unsqueeze(-1)
+#             else:
+#                 raise ValueError("attention_mask must be (B,L) or (B,1,L)")
+#             i = i * mask
 
-        """ # Recurrent scan over time (vectorized loop)
-        s = x.new_zeros(B, E)  # per-batch state
-        outs = []
-        for t in range(L):
-            s = f[:, t, :] * s + i[:, t, :]
-            # Fused gate (code-faithful): SiLU(g_logits) * RMSNorm(s)
-            g_logits_t = self.g_proj(x[:, t, :])      # (B,E)
-            y_t = F.silu(g_logits_t) * self.rms(s)    # (B,E)
-            outs.append(self.o_proj(y_t))             # (B,H)
+#         """ # Recurrent scan over time (vectorized loop)
+#         s = x.new_zeros(B, E)  # per-batch state
+#         outs = []
+#         for t in range(L):
+#             s = f[:, t, :] * s + i[:, t, :]
+#             # Fused gate (code-faithful): SiLU(g_logits) * RMSNorm(s)
+#             g_logits_t = self.g_proj(x[:, t, :])      # (B,E)
+#             y_t = F.silu(g_logits_t) * self.rms(s)    # (B,E)
+#             outs.append(self.o_proj(y_t))             # (B,H)
 
-        return torch.stack(outs, dim=1)  # (B,L,H) """
+#         return torch.stack(outs, dim=1)  # (B,L,H) """
 
-        # --- Recurrent scan (vectorized) ---
-        # s_t = f_t * s_{t-1} + i_t with s0 = 0
-        prefix = torch.cumprod(f, dim=1)                                  # (B,L,E)
-        denom  = torch.cat([torch.ones_like(prefix[:, :1]), prefix[:, :-1]], dim=1)
-        s = prefix * torch.cumsum(i / denom.clamp_min(1e-8), dim=1)       # (B,L,E)
+#         # --- Recurrent scan (vectorized) ---
+#         # s_t = f_t * s_{t-1} + i_t with s0 = 0
+#         prefix = torch.cumprod(f, dim=1)                                  # (B,L,E)
+#         denom  = torch.cat([torch.ones_like(prefix[:, :1]), prefix[:, :-1]], dim=1)
+#         s = prefix * torch.cumsum(i / denom.clamp_min(1e-8), dim=1)       # (B,L,E)
 
-        # Output gate path
-        g_logits = self.g_proj(x)                # (B,L,E)
-        y = F.silu(g_logits) * self.rms(s)       # (B,L,E)
-        out = self.o_proj(y)                     # (B,L,dim)
-        return out
+#         # Output gate path
+#         g_logits = self.g_proj(x)                # (B,L,E)
+#         y = F.silu(g_logits) * self.rms(s)       # (B,L,E)
+#         out = self.o_proj(y)                     # (B,L,dim)
+#         return out
 
 
 ##############################
@@ -895,7 +917,7 @@ class MlpHead(nn.Module):
     """ MLP classification head
     """
     def __init__(self, dim, num_classes=1000, mlp_ratio=4, act_layer=SquaredReLU,
-        norm_layer=RMSNorm, head_dropout=0., bias=True): # replaced nn.LayerNorm with RMSNorm
+        norm_layer=nn.LayerNorm, head_dropout=0., bias=True): # replaced nn.LayerNorm with RMSNorm
         super().__init__()
         hidden_features = int(mlp_ratio * dim)
         self.fc1 = BitLinear(dim, hidden_features, bias=bias) # Replaced nn.Linear with BitLinear
@@ -953,10 +975,11 @@ class MinimalHGRNChannelMixer(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
 
-    @staticmethod
-    def _swiglu(gate: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # Same structure used in the repo: swiglu(gate, y) = SiLU(gate) * y
-        return F.silu(gate) * y
+    # commented out, now using swiglu from activations.py
+    # @staticmethod
+    # def _swiglu(gate: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    #     # Same structure used in the repo: swiglu(gate, y) = SiLU(gate) * y
+    #     return F.silu(gate) * y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -965,7 +988,7 @@ class MinimalHGRNChannelMixer(nn.Module):
         """
         h = self.gate_proj(x)                        # (B,L,2*I)
         gate, y = h.chunk(2, dim=-1)                # (B,L,I), (B,L,I)
-        z = self._swiglu(gate, y)                   # (B,L,I)
+        z = activations.swiglu(gate, y)                   # (B,L,I)
         out = self.down_proj(z)                     # (B,L,dim)
         return out
 
@@ -987,7 +1010,7 @@ class MetaFormerBlock(nn.Module):
         super().__init__()
 
         self.norm1 = norm_layer(dim) 
-        self.token_mixer = SeqAdapter(token_mixer(dim=dim, drop=drop), layout="NHWC") 
+        self.token_mixer = token_mixer(dim=dim, drop=drop) #SeqAdapter(, layout="NHWC") # used to have seqadapter, maybe no longer needed? 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -995,7 +1018,7 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         self.norm2 = norm_layer(dim) 
-        self.mlp = SeqAdapter(mlp(dim=dim, drop=drop), "NHWC") 
+        self.mlp = mlp(dim=dim, drop=drop) # SeqAdapter( , "NHWC") remove seqadapter
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -1004,14 +1027,14 @@ class MetaFormerBlock(nn.Module):
         
     def forward(self, x):
         # TODO:
-        # residual = hidden_states (or in this case, x)
-        # hidden_states = self.attn_norm(hidden_states)
-        # hidden_states, attentions, past_key_values = self.attn(hidden_states = hidden_states, 
-        #                                                        attention_mask = attention_mask, 
-        #                                                        past_key_values = past_key_values,
-        #                                                        use_cache = use_cache, 
-        #                                                        output_attentions = output_attentions, 
-        #                                                        lower_bound = lower_bound)
+        # residual = x #(or in this case, x)
+        # hidden_states = self.norm1(x)
+        # hidden_states, attentions, past_key_values = self.token_mixer(dim = hidden_states, 
+        #                                                        #attention_mask = attention_mask, 
+        #                                                        past_key_values = past_key_values)
+        #                                                        #use_cache = use_cache, 
+        #                                                        #output_attentions = output_attentions, 
+        #                                                        #lower_bound = lower_bound)
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
@@ -1024,7 +1047,7 @@ class MetaFormerBlock(nn.Module):
                     self.mlp(self.norm2(x))
                 )
             )
-        # hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        # hidden_states, residual = self.norm2(hidden_states, residual, True)
         # hidden_states = self.mlp(hidden_states)
         # hidden_states = residual + hidden_states
 
@@ -1418,10 +1441,10 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
     model = MetaFormer(
         depths=[3, 3, 9, 3], 
         dims=[64, 128, 320, 512], 
-        token_mixers=MinimalHGRNCore, 
+        token_mixers=MatMulFreeGRU, # was MinimalHGRNCore
         mlp=MinimalHGRNChannelMixer,
         head_fn=MlpHead, 
-        norm_layers = partial(RMSNorm, eps=1e-6), 
+        norm_layers = partial(layernorm.RMSNorm, eps=1e-6), #had partial, don't think it is needed?
         **kwargs)
     model.default_cfg = default_cfgs['matmulfreeformer_s18']
     #model.default_cfg = default_cfgs['convformer_s18']

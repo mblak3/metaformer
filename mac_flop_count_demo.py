@@ -23,6 +23,8 @@ More detail can be found in [this repo](https://github.com/sail-sg/metaformer).
 #!pip install fvcore
 #cd /content/metaformer
 
+import torch
+from deepspeed.profiling.flops_profiler import get_model_profile
 import argparse
 import metaformer_baselines # load model of MetaFormer baselines
 from PIL import Image
@@ -30,28 +32,57 @@ from timm.data import create_transform
 from timm.models import load_checkpoint
 from torchprofile import profile_macs
 from fvcore.nn import FlopCountAnalysis, parameter_count_table
+from thop import profile
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Validation')
 parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 def demo(args):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     #model = metaformer_baselines.caformer_s18(pretrained=True) # can change different model name
     model = metaformer_baselines.matmulfreeformer_s18()
-    load_checkpoint(model, args.checkpoint)
+    #load_checkpoint(model, args.checkpoint)
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    # timm-style checkpoints are often {"state_dict": ...} or {"model": ...}
+    state_dict = ckpt.get("state_dict", ckpt.get("model", ckpt))
+
+    # sometimes keys are prefixed with "module."
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print("missing:", len(missing), "unexpected:", len(unexpected))
+
+    model = model.to(device)
     model.eval()
     transform = create_transform(input_size=224, crop_pct=model.default_cfg['crop_pct'])
     image = Image.open('./cat.jpg')
     input_image = transform(image).unsqueeze(0)
+    input_image = input_image.to(device)
 
-    macs = profile_macs(model, input_image)
+    # macs, params = profile(model, inputs=(input_image,), verbose=False)
 
-    fvcoreflops = FlopCountAnalysis(model, input_image)
+    # print("MACs:", macs, "Params:", params)
+    # print('transformer: {:.4g} G'.format(macs / 1e9))
+    # print(parameter_count_table(model))
 
-    print(macs)
-    print('transformer: {:.4g} G'.format(macs / 1e9))
+    flops, macs, params = get_model_profile(
+       model=model,
+       args=(input_image,),
+       print_profile=False,
+       detailed=False,
+    )
+    print("MACs:", macs)
 
-    print(fvcoreflops.total())
-    print(parameter_count_table(model))
+    # macs = profile_macs(model, input_image)
+
+    # fvcoreflops = FlopCountAnalysis(model, input_image)
+
+    # print(macs)
+    # print('transformer: {:.4g} G'.format(macs / 1e9))
+
+    # print(fvcoreflops.total())
+    # print(parameter_count_table(model))
 
     #@title ImageNet classes
     imagenet_classes = {0: 'tench, Tinca tinca',
