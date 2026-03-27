@@ -69,8 +69,8 @@ def demo(args):
     flops, macs, params = get_model_profile(
        model=model,
        args=(input_image,),
-       print_profile=False,
-       detailed=False,
+       print_profile=True,
+       detailed=True,
     )
     print("MACs:", macs)
 

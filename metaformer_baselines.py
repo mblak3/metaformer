@@ -33,7 +33,10 @@ import layernorm
 
 from einops import rearrange
 # Added Cache, what does it do?
+# Ok, apparently Cache is not needed for our ViT, as it is not streaming/autoregressive
 from transformers.cache_utils import Cache
+
+from transformers.activations import ACT2FN
 
 # need to implement this, probably triton
 #from mmfreelm.modules.activations import swiglu
@@ -970,10 +973,13 @@ class MinimalHGRNChannelMixer(nn.Module):
         self.gate_proj = linear_cls(dim, 2 * intermediate_size, bias=False)
         self.down_proj = linear_cls(intermediate_size, dim, bias=False)
 
+        self.act_fn = ACT2FN[hidden_act]
+
         # Mild init (same spirit as before; swap if you need exact repo init)
-        for m in [self.gate_proj, self.down_proj]:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
+        # What does this do? Commented out for now
+        #for m in [self.gate_proj, self.down_proj]:
+        #    if isinstance(m, nn.Linear):
+        #        nn.init.xavier_uniform_(m.weight, gain=2 ** -2.5)
 
     # commented out, now using swiglu from activations.py
     # @staticmethod
