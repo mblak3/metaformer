@@ -31,6 +31,8 @@ import fused_norm_gate
 
 import layernorm
 
+from fusedbitnet import FusedBitLinear as BitLinear
+
 from einops import rearrange
 # Added Cache, what does it do?
 # Ok, apparently Cache is not needed for our ViT, as it is not streaming/autoregressive
@@ -455,192 +457,6 @@ class RMSNorm_old(nn.Module):
             x = x + self.bias
         return x
     
-# class RMSNorm(nn.Module):
-#     def __init__(self, dim: int, eps: float = 1e-5):
-#         super().__init__()
-#         self.eps = eps
-#         self.weight = nn.Parameter(torch.ones(dim))
-#     def forward(self, x):
-#         v = x.float().pow(2).mean(dim=-1, keepdim=True)
-#         x_hat = x * torch.rsqrt(v + self.eps)
-#         return (x_hat * self.weight).type_as(x)
-    
-##############################
-# End                        #
-##############################
-
-##############################
-# Add matmulfree token mixer #
-##############################
-
-def activation_quant(x):
-    """
-    Per-token quantization to 8 bits. No grouping is needed for quantization.
-
-    Args:
-        x: An activation tensor with shape [n, d].
-
-    Returns:
-        A quantized activation tensor with shape [n, d].
-    """
-    # Compute the scale factor
-    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
-    # Quantize and then de-quantize the tensor
-    y = (x * scale).round().clamp_(-128, 127) / scale
-    return y
-
-
-def weight_quant(w):
-    """
-    Per-tensor quantization to 1.58 bits. No grouping is needed for quantization.
-
-    Args:
-        w: A weight tensor with shape [d, k].
-
-    Returns:
-        A quantized weight tensor with shape [d, k].
-    """
-    # Compute the scale factor
-    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)
-    # Quantize and then de-quantize the tensor
-    u = (w * scale).round().clamp_(-1, 1) / scale
-    return u
-
-class BitLinear(nn.Linear):
-    """
-    A custom linear layer that applies quantization on both activations and weights.
-    This is primarily for training; kernel optimization is needed for efficiency in deployment.
-    """
-
-    def __init__(self, in_features, out_features, bias=False):
-        """
-        Initializes the BitLinear layer.
-
-        Args:
-            in_features: Size of each input sample.
-            out_features: Size of each output sample.
-            bias: If set to False, the layer will not learn an additive bias. Default: True.
-        """
-        # Initialize the superclass nn.Linear with the given parameters
-        super(BitLinear, self).__init__(in_features, out_features, bias=bias)
-        self.norm = layernorm.RMSNorm(in_features, eps=1e-8)
-
-    def forward(self, x):
-        """
-        Overrides the forward pass to include quantization.
-
-        Args:
-            x: An input tensor with shape [n, d].
-
-        Returns:
-            An output tensor with shape [n, d].
-        """
-        # Weight tensor
-        w = self.weight
-
-        # Apply RMS normalization to the input
-        x_norm = self.norm(x)
-
-        # Apply quantization to both activations and weights
-        # Uses Straight-Through Estimator (STE) trick with .detach() for gradient flow
-        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
-        w_quant = w + (weight_quant(w) - w).detach()
-        # Perform linear operation with quantized values
-        y = F.linear(x_quant, w_quant)
-
-        return y
-
-##############################
-# Old ideas, to be removed   #
-##############################
-# MatMulFreeAttn 
-# class MatMulFree(nn.Module):
-#     """def __init__():
-#         super().__init__()
-
-#     def forward(self, x):
-
-#         return x"""
-    
-#     def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
-#         attn_drop=0., proj_drop=0., proj_bias=False, **kwargs):
-#         super().__init__()
-
-#         self.head_dim = head_dim
-#         self.scale = head_dim ** -0.5
-
-#         self.num_heads = num_heads if num_heads else dim // head_dim
-#         if self.num_heads == 0:
-#             self.num_heads = 1
-        
-#         self.attention_dim = self.num_heads * self.head_dim
-
-#         self.qkv = BitLinear(dim, self.attention_dim * 3, bias=qkv_bias) # Replaced nn.Linear with BitLinear
-#         self.attn_drop = nn.Dropout(attn_drop)
-#         self.proj = BitLinear(self.attention_dim, dim, bias=proj_bias) # Replaced nn.Linear with BitLinear
-#         self.proj_drop = nn.Dropout(proj_drop)
-
-        
-#     def forward(self, x):
-#         B, H, W, C = x.shape
-#         N = H * W
-#         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-#         q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
-#         attn = (q @ k.transpose(-2, -1)) * self.scale
-#         attn = attn.softmax(dim=-1)
-#         attn = self.attn_drop(attn)
-
-#         x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.attention_dim)
-#         x = self.proj(x)
-#         x = self.proj_drop(x)
-#         return x
-    
-# # Matmul-free GRU to act as a token mixer   
-# class MatMulFreeGRU(nn.Module):
-#     """
-#     Single-layer GRU unrolled across N tokens with fused input projections.
-#     Keeps a final proj + dropout to mirror Attention.
-#     """
-#     def __init__(self, dim, proj_drop=0.0, bias=True, proj_bias=False, **kwargs):
-#         super().__init__()
-#         self.dim = dim
-#         # x projections (z, r, n)
-#         self.x_proj = nn.Linear(dim, 3 * dim, bias=bias)
-#         # h projections (z, r, n)
-#         self.h_proj = nn.Linear(dim, 3 * dim, bias=bias)
-#         self.proj = nn.Linear(dim, dim, bias=proj_bias)
-#         self.proj_drop = nn.Dropout(proj_drop)
-
-#     def forward(self, x):
-#         B, H, W, C = x.shape
-#         N = H * W
-#         seq = x.view(B, N, C)
-
-#         h = torch.zeros(B, C, device=seq.device, dtype=seq.dtype)
-#         outs = []
-#         for t in range(N):
-#             xt = seq[:, t, :]
-#             x_zrn = self.x_proj(xt)
-#             h_zrn = self.h_proj(h)
-#             x_z, x_r, x_n = x_zrn.chunk(3, dim=-1)
-#             h_z, h_r, h_n = h_zrn.chunk(3, dim=-1)
-
-#             z = torch.sigmoid(x_z + h_z)
-#             r = torch.sigmoid(x_r + h_r)
-#             n = torch.tanh(x_n + r * h_n)
-#             h = (1 - z) * n + z * h
-#             outs.append(h)
-
-#         y = torch.stack(outs, dim=1)  # (B, N, C)
-#         y = self.proj(y)
-#         y = self.proj_drop(y)
-#         y = y.view(B, H, W, C)
-#         return y
-    
-##############################
-# End                        #
-##############################
 
 ##############################
 # New MMFGRU (WIP)           #
@@ -705,7 +521,10 @@ class MatMulFreeGRU(nn.Module):
                 lower_bound: Optional[torch.Tensor] = None,
                 **kwargs): # -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         # This is the triton code
-        mode = 'fused_recurrent' if x.shape[1] == 1 else self.mode
+        # "looks inherited from autoregressive code. For vision, x.shape[1] is height if you are in BHWC, 
+        # so this condition is not really a decode/prefill switch anymore. I would just use mode = self.mode"
+        # mode = 'fused_recurrent' if x.shape[1] == 1 else self.mode
+        mode = self.mode
 
         last_state = past_key_values[self.layer_idx] if use_cache else None
 
@@ -715,9 +534,10 @@ class MatMulFreeGRU(nn.Module):
         f = f.sigmoid() # how does this work
 
         if lower_bound is not None and self.layer_idx > 0:
-            f = lower_bound + (1 - lower_bound) * F
+            f = lower_bound + (1 - lower_bound) * f # changed F to f, was probably a typo but not sure if this code was ever run.
         i = activations.swiglu(i, 1 - f) # need to implement 
 
+        #print("x shape:", x.shape)
         #print("i shape:", i.shape)
         #print("f shape:", f.shape)
 
@@ -728,20 +548,29 @@ class MatMulFreeGRU(nn.Module):
 
         recurrent_state = last_state[-1] if use_cache else None
 
+        #print("i shape after rearrange:", i.shape)
+        #print("f shape after rearrange:", f.shape)
+
+
         # This is the second part of the triton code
         if mode == 'fused_recurrent':
             o, recurrent_state = recurrent_fuse.fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
         
-        if past_key_values is not None:
-            last_state = (recurrent_state,)
-            past_key_values.update(last_state, self.layer_idx, i.shape[2]) # is this shape correct?
+        # "The cache logic also looks inherited from language-model code. For standard image classification training/inference, 
+        # past_key_values, layer_idx, and use_cache are usually irrelevant. They may be harmless, but they add branches and make profiling noisier."
+        # commenting these out, but that shouldn't change anything. To be later removed 
+        #if past_key_values is not None:
+        #    last_state = (recurrent_state,)
+        #    past_key_values.update(last_state, self.layer_idx, i.shape[2]) # is this shape correct?
 
         #print("o shape:", o.shape)
 
         o = self.g_norm(self.g_proj(x), rearrange(o, 'b h l d -> b l (h d)'))
         o = self.o_proj(o)
+
+        #print("o shape exit:", o.shape)
 
         return o  #, None, past_key_values
 
@@ -1016,7 +845,7 @@ class MetaFormerBlock(nn.Module):
         super().__init__()
 
         self.norm1 = norm_layer(dim) 
-        self.token_mixer = token_mixer(dim=dim, drop=drop) #SeqAdapter(, layout="NHWC") # used to have seqadapter, maybe no longer needed? 
+        self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -1024,23 +853,14 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         self.norm2 = norm_layer(dim) 
-        self.mlp = mlp(dim=dim, drop=drop) # SeqAdapter( , "NHWC") remove seqadapter
+        self.mlp = mlp(dim=dim, drop=drop) 
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
         self.res_scale2 = Scale(dim=dim, init_value=res_scale_init_value) \
             if res_scale_init_value else nn.Identity()
         
-    def forward(self, x):
-        # TODO:
-        # residual = x #(or in this case, x)
-        # hidden_states = self.norm1(x)
-        # hidden_states, attentions, past_key_values = self.token_mixer(dim = hidden_states, 
-        #                                                        #attention_mask = attention_mask, 
-        #                                                        past_key_values = past_key_values)
-        #                                                        #use_cache = use_cache, 
-        #                                                        #output_attentions = output_attentions, 
-        #                                                        #lower_bound = lower_bound)
+    def forward(self, x):        
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
@@ -1053,12 +873,6 @@ class MetaFormerBlock(nn.Module):
                     self.mlp(self.norm2(x))
                 )
             )
-        # hidden_states, residual = self.norm2(hidden_states, residual, True)
-        # hidden_states = self.mlp(hidden_states)
-        # hidden_states = residual + hidden_states
-
-        # outputs = (hidden_states, attentions, past_key_values)
-        # return outputs
         return x
 
 

@@ -373,6 +373,11 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
+# code for reducing the learning rate scheduler by half midway through training
+def apply_lr_halfway_scale(optimizer, scale=0.5):
+    for param_group in optimizer.param_groups:
+        param_group["lr_scale"] = param_group.get("lr_scale", 1.0) * scale
+        param_group["lr"] *= scale  # immediate effect for the current already-set LR
 
 def main():
     utils.setup_default_logging()
@@ -462,6 +467,8 @@ def main():
 
     data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
+    #print(model)
+    #exit(0)
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -696,7 +703,16 @@ def main():
             f.write(args_text)
 
     try:
+        # code for reducing the learning rate scheduler by half midway through training
+        halfway_lr_scaled = False
+        halfway_epoch = num_epochs // 2
+
+
         for epoch in range(start_epoch, num_epochs):
+            if epoch >= halfway_epoch and not halfway_lr_scaled:
+                apply_lr_halfway_scale(optimizer, scale=0.5)
+                halfway_lr_scaled = True
+
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
@@ -857,8 +873,19 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    return OrderedDict([('loss', losses_m.avg)])
+    # Old return statement 
+    #return OrderedDict([('loss', losses_m.avg)])
 
+    # New logging logic 
+    lrl = [param_group['lr'] for param_group in optimizer.param_groups]
+    lr = sum(lrl) / len(lrl)
+
+    return OrderedDict([
+        ('loss', losses_m.avg),
+        ('lr', lr),
+        ('batch_time', batch_time_m.avg),
+        ('time', batch_time_m.sum),
+    ])
 
 def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
     batch_time_m = utils.AverageMeter()
