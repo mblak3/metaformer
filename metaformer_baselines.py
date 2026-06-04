@@ -478,9 +478,12 @@ class MatMulFreeGRU(nn.Module):
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
 
-        self.num_heads = num_heads if num_heads else dim // head_dim
-        if self.num_heads == 0:
-            self.num_heads = 1
+        #self.num_heads = num_heads if num_heads else dim // head_dim
+        #if self.num_heads == 0:
+        #    self.num_heads = 1
+
+        # TODO: May 22, 2026 TESTING NUM_HEADS = 1 REMOVE OR CHANGE LATER
+        self.num_heads = 1
         
         # attention_dim is for attention, no equivalent here
         #self.attention_dim = self.num_heads * self.head_dim
@@ -831,6 +834,14 @@ class MinimalHGRNChannelMixer(nn.Module):
 # End                        #
 ##############################
 
+##############################
+# HGRN2 Code                 #
+##############################
+
+##############################
+# End                        #
+##############################
+
 class MetaFormerBlock(nn.Module):
     """
     Implementation of one MetaFormer block.
@@ -844,7 +855,7 @@ class MetaFormerBlock(nn.Module):
 
         super().__init__()
 
-        self.norm1 = norm_layer(dim) 
+        #self.norm1 = norm_layer(dim) 
         self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
@@ -852,7 +863,7 @@ class MetaFormerBlock(nn.Module):
         self.res_scale1 = Scale(dim=dim, init_value=res_scale_init_value) \
             if res_scale_init_value else nn.Identity()
 
-        self.norm2 = norm_layer(dim) 
+        #self.norm2 = norm_layer(dim) 
         self.mlp = mlp(dim=dim, drop=drop) 
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
@@ -861,20 +872,32 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
         
     def forward(self, x):        
+        # x = self.res_scale1(x) + \
+        #     self.layer_scale1(
+        #         self.drop_path1(
+        #             self.token_mixer(self.norm1(x))
+        #         )
+        #     )
+        # x = self.res_scale2(x) + \
+        #     self.layer_scale2(
+        #         self.drop_path2(
+        #             self.mlp(self.norm2(x))
+        #         )
+        #     )
+        # return x
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
-                    self.token_mixer(self.norm1(x))
+                    self.token_mixer(x)
                 )
             )
         x = self.res_scale2(x) + \
             self.layer_scale2(
                 self.drop_path2(
-                    self.mlp(self.norm2(x))
+                    self.mlp(x)
                 )
             )
         return x
-
 
 r"""
 downsampling (stem) for the first stage is a layer of conv with k7, s4 and p2

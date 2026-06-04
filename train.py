@@ -373,11 +373,28 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
-# code for reducing the learning rate scheduler by half midway through training
-def apply_lr_halfway_scale(optimizer, scale=0.5):
+def reduce_scheduler_lr_once(lr_scheduler, optimizer, factor=0.5, scale_min_lr=True):
+    """Apply a one-time LR reduction that persists through future scheduler steps."""
+
+    if lr_scheduler is not None:
+        # Future cosine LR values are based on scheduler.base_values.
+        if hasattr(lr_scheduler, "base_values"):
+            lr_scheduler.base_values = [v * factor for v in lr_scheduler.base_values]
+
+        # For exact "half of the cosine LR", also halve the cosine floor.
+        # If you want to keep the original --min-lr floor, set scale_min_lr=False.
+        if scale_min_lr and hasattr(lr_scheduler, "lr_min"):
+            lr_scheduler.lr_min *= factor
+
+    # Also halve the currently active optimizer LR immediately,
+    # so epoch 150 starts at the reduced LR.
     for param_group in optimizer.param_groups:
-        param_group["lr_scale"] = param_group.get("lr_scale", 1.0) * scale
-        param_group["lr"] *= scale  # immediate effect for the current already-set LR
+        param_group["lr"] *= factor
+        param_group["weight_decay"] = 0.0
+
+    # Set weight decay to 0.0
+    #for param_group in optimizer.param_groups: 
+    #    param_group["weight_decay"] = 0.0
 
 def main():
     utils.setup_default_logging()
@@ -702,17 +719,18 @@ def main():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
+    lr_half_epoch = 150
+    lr_half_applied = False
+
     try:
-        # code for reducing the learning rate scheduler by half midway through training
-        halfway_lr_scaled = False
-        halfway_epoch = num_epochs // 2
-
-
         for epoch in range(start_epoch, num_epochs):
-            if epoch >= halfway_epoch and not halfway_lr_scaled:
-                apply_lr_halfway_scale(optimizer, scale=0.5)
-                halfway_lr_scaled = True
+            if epoch == lr_half_epoch and not lr_half_applied:
+                reduce_scheduler_lr_once(lr_scheduler=lr_scheduler, optimizer=optimizer, factor=0.5, scale_min_lr=True)
+                lr_half_applied = True
 
+                if args.local_rank == 0:
+                    _logger.info(f"Reduced scheduler LR by half once at epoch {epoch}.")
+            
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
@@ -873,9 +891,9 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    # Old return statement 
+    # Old return statement
     #return OrderedDict([('loss', losses_m.avg)])
-
+    
     # New logging logic 
     lrl = [param_group['lr'] for param_group in optimizer.param_groups]
     lr = sum(lrl) / len(lrl)
