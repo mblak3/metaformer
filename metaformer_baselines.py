@@ -22,18 +22,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#For Triton code
+# For Triton code
 import recurrent_fuse
-
 import activations
-
 import fused_norm_gate
-
 import layernorm
-
 from fusedbitnet import FusedBitLinear as BitLinear
 
-from einops import rearrange
+# For HGRN2 code
+from hgru2_pytorch.modules.hgru2_2d_series import Hgru2_2d_series
+import torch.distributed as dist
+import logging
+
+from einops import rearrange, repeat
 # Added Cache, what does it do?
 # Ok, apparently Cache is not needed for our ViT, as it is not streaming/autoregressive
 from transformers.cache_utils import Cache
@@ -97,6 +98,7 @@ default_cfgs = {
         url='https://huggingface.co/sail/dl/resolve/main/poolformerv2/poolformerv2_m48.pth'),
 
     'matmulfreeformer_s18': _cfg(),
+    'hgrn2former_s18': _cfg(),
     'baselineformer_s18': _cfg(),
 
     'convformer_s18': _cfg(
@@ -711,6 +713,97 @@ class MinimalHGRNChannelMixer(nn.Module):
 # HGRN2 Code                 #
 ##############################
 
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+def is_main_process():
+    return get_rank() == 0
+
+def get_activation_fn(activation):
+    if activation == "gelu":
+        return F.gelu
+    elif activation == "relu":
+        return F.relu
+    elif activation == "elu":
+        return F.elu
+    elif activation == "sigmoid":
+        return F.sigmoid
+    elif activation == "exp":
+        return torch.exp
+    elif activation == "leak":
+        return F.leaky_relu
+    elif activation == "1+elu":
+        def f(x):
+            return 1 + F.elu(x)
+        return f
+    elif activation == "silu":
+        return F.silu
+    else:
+        return lambda x: x
+
+def print_params(**kwargs):
+    if is_main_process():
+        logging.info(f"start print config of {kwargs['__class__']}")
+        for key in kwargs:
+            if key in ["__class__", "self"]:
+                continue
+            logging.info(f"{key}: {kwargs[key]}")
+        logging.info(f"end print config of {kwargs['__class__']}")
+
+
+class GLU(nn.Module):
+    def __init__(self, d1, d2, act_fun, fina_act="None", dropout=0.0, bias=True):
+        super().__init__()
+        # get local varables
+        params = locals()
+        # print params
+        print_params(**params)
+        
+        self.l1 = nn.Linear(d1, d2, bias=bias)
+        self.l2 = nn.Linear(d1, d2, bias=bias)
+        self.l3 = nn.Linear(d2, d1, bias=bias)
+        self.act_fun = get_activation_fn(act_fun)
+        self.p = dropout
+        if self.p > 0.0:
+            self.dropout = nn.Dropout(p=dropout)
+        self.fina_act = get_activation_fn(fina_act)
+
+    def forward(self, x):
+        o1 = self.l1(x)
+        weight = self.act_fun(o1)
+        if self.p > 0.0:
+            weight = self.dropout(weight)
+        o2 = self.l2(x)
+        output = weight * o2
+        output = self.l3(output)
+        output = self.fina_act(output)
+
+        return output
+
+class HGRN2(nn.Module):
+    # Wrapper for Hgru2_2d_series
+    def __init__(
+        self, 
+        dim,
+        expand
+    ):
+        super().__init__()
+        self._hgrn2 = Hgru2_2d_series()
+
+    def foward(self):
+        output = self._hgrn2()
+        return output
+    
+
 ##############################
 # End                        #
 ##############################
@@ -720,7 +813,7 @@ class MetaFormerBlock(nn.Module):
     Implementation of one MetaFormer block.
     """
     def __init__(self, dim,
-                 token_mixer=nn.Identity, mlp=Mlp,
+                 token_mixer=nn.Identity, mlp=GLU,
                  norm_layer=nn.LayerNorm,
                  drop=0., drop_path=0.,
                  layer_scale_init_value=None, res_scale_init_value=None
@@ -728,8 +821,16 @@ class MetaFormerBlock(nn.Module):
 
         super().__init__()
 
-        #self.norm1 = norm_layer(dim) 
-        self.token_mixer = token_mixer(dim=dim, drop=drop) 
+        #self.norm1 = norm_layer(dim)
+        print("token mixer: ")
+        print(token_mixer)
+        if token_mixer == Hgru2_2d_series:
+            print("tokenmixer1")
+            self.token_mixer = token_mixer(embed_dim=dim, expand_ratio=1)
+        else:
+            print("tokenmixer2")
+            self.token_mixer = token_mixer(dim=dim, drop=drop)
+        #self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -737,7 +838,14 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         #self.norm2 = norm_layer(dim) 
-        self.mlp = mlp(dim=dim, drop=drop) 
+        print("channel mixer: ")
+        print(mlp)
+        if mlp == GLU:
+            print("mlp1")
+            self.mlp = mlp(d1=dim, d2= 3 * dim, act_fun="silu") #, drop=drop)
+        else:
+            print("mlp2")
+            self.mlp = mlp(dim=dim, drop=drop)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -1163,6 +1271,21 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
         norm_layers = partial(layernorm.RMSNorm, eps=1e-6), #had partial, don't think it is needed?
         **kwargs)
     model.default_cfg = default_cfgs['matmulfreeformer_s18']
+    #model.default_cfg = default_cfgs['convformer_s18']
+
+    return model
+
+@register_model
+def hgrn2former_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3], 
+        dims=[64, 128, 320, 512], 
+        token_mixers=Hgru2_2d_series, # TODO: implement wrapper and change to said wrapper
+        mlp=GLU,
+        head_fn=MlpHead, 
+        #norm_layers = partial(layernorm.RMSNorm, eps=1e-6), #had partial, don't think it is needed?
+        **kwargs)
+    model.default_cfg = default_cfgs['hgrn2former_s18']
     #model.default_cfg = default_cfgs['convformer_s18']
 
     return model
