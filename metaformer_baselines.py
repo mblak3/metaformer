@@ -530,7 +530,7 @@ class MatMulFreeGRU(nn.Module):
         mode = self.mode
 
         last_state = past_key_values[self.layer_idx] if use_cache else None
-
+        # what is the shape of x?
         i = self.i_proj(x)
         f = self.f_proj(x)
 
@@ -755,10 +755,10 @@ class MlpHead(nn.Module):
         norm_layer=nn.LayerNorm, head_dropout=0., bias=True): # replaced nn.LayerNorm with RMSNorm
         super().__init__()
         hidden_features = int(mlp_ratio * dim)
-        self.fc1 = BitLinear(dim, hidden_features, bias=bias) # Replaced nn.Linear with BitLinear
+        self.fc1 = nn.Linear(dim, hidden_features, bias=bias) # Replaced nn.Linear with BitLinear
         self.act = act_layer()
         self.norm = norm_layer(hidden_features)
-        self.fc2 = BitLinear(hidden_features, num_classes, bias=bias) # Replaced nn.Linear with BitLinear
+        self.fc2 = nn.Linear(hidden_features, num_classes, bias=bias) # Replaced nn.Linear with BitLinear
         self.head_dropout = nn.Dropout(head_dropout)
 
 
