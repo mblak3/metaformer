@@ -822,13 +822,13 @@ class MetaFormerBlock(nn.Module):
         super().__init__()
 
         #self.norm1 = norm_layer(dim)
-        print("token mixer: ")
-        print(token_mixer)
+        #print("token mixer: ")
+        #print(token_mixer)
         if token_mixer == Hgru2_2d_series:
-            print("tokenmixer1")
+            #print("tokenmixer1")
             self.token_mixer = token_mixer(embed_dim=dim, expand_ratio=1)
         else:
-            print("tokenmixer2")
+            #print("tokenmixer2")
             self.token_mixer = token_mixer(dim=dim, drop=drop)
         #self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
@@ -838,13 +838,15 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         #self.norm2 = norm_layer(dim) 
-        print("channel mixer: ")
-        print(mlp)
+        #print("channel mixer: ")
+        #print(mlp)
         if mlp == GLU:
-            print("mlp1")
+            #print("mlp1")
             self.mlp = mlp(d1=dim, d2= 3 * dim, act_fun="silu") #, drop=drop)
         else:
-            print("mlp2")
+            #if mlp == MinimalHGRNChannelMixer:
+            #    print("MinimalHGRNChannelMixer")
+            #print("mlp2")
             self.mlp = mlp(dim=dim, drop=drop)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
@@ -1266,7 +1268,7 @@ def matmulfreeformer_s18(pretrained=False, **kwargs):
         depths=[3, 3, 9, 3], 
         dims=[64, 128, 320, 512], 
         token_mixers=MatMulFreeGRU, # was MinimalHGRNCore
-        mlp=MinimalHGRNChannelMixer,
+        mlps=MinimalHGRNChannelMixer,
         head_fn=MlpHead, 
         norm_layers = partial(layernorm.RMSNorm, eps=1e-6), #had partial, don't think it is needed?
         **kwargs)
@@ -1281,7 +1283,7 @@ def hgrn2former_s18(pretrained=False, **kwargs):
         depths=[3, 3, 9, 3], 
         dims=[64, 128, 320, 512], 
         token_mixers=Hgru2_2d_series, # TODO: implement wrapper and change to said wrapper
-        mlp=GLU,
+        mlps=GLU,
         head_fn=MlpHead, 
         #norm_layers = partial(layernorm.RMSNorm, eps=1e-6), #had partial, don't think it is needed?
         **kwargs)
