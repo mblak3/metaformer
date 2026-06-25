@@ -253,6 +253,7 @@ class Downsampling(nn.Module):
         self.post_norm = post_norm(out_channels) if post_norm else nn.Identity()
 
     def forward(self, x):
+        #print("downsample in: ", x.shape)
         x = self.pre_norm(x)
         if self.pre_permute:
             # if take [B, H, W, C] as input, permute it to [B, C, H, W]
@@ -260,6 +261,7 @@ class Downsampling(nn.Module):
         x = self.conv(x)
         x = x.permute(0, 2, 3, 1) # [B, C, H, W] -> [B, H, W, C]
         x = self.post_norm(x)
+        #print("downsample out: ", x.shape)
         return x
 
 
@@ -506,6 +508,7 @@ class MatMulFreeGRU(nn.Module):
 
         f = f.sigmoid() # how does this work
 
+        # TODO: June 24 NEED TO TEST IF THIS IS USED AT ALL 
         if lower_bound is not None and self.layer_idx > 0:
             f = lower_bound + (1 - lower_bound) * f # changed F to f, was probably a typo but not sure if this code was ever run.
         i = activations.swiglu(i, 1 - f) # need to implement 
@@ -853,8 +856,10 @@ class MetaFormerBlock(nn.Module):
             if layer_scale_init_value else nn.Identity()
         self.res_scale2 = Scale(dim=dim, init_value=res_scale_init_value) \
             if res_scale_init_value else nn.Identity()
+
         
-    def forward(self, x):        
+        
+    def forward(self, x, lower_bound=None):        
         # x = self.res_scale1(x) + \
         #     self.layer_scale1(
         #         self.drop_path1(
@@ -868,10 +873,15 @@ class MetaFormerBlock(nn.Module):
         #         )
         #     )
         # return x
+        if lower_bound is None:
+            token_output = self.token_mixer(x)
+        else:
+            token_output = self.token_mixer(x, lower_bound=lower_bound)
+        
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
-                    self.token_mixer(x)
+                    token_output
                 )
             )
         x = self.res_scale2(x) + \
@@ -994,6 +1004,11 @@ class MetaFormer(nn.Module):
             self.head = head_fn(dims[-1], num_classes)
 
         self.apply(self._init_weights)
+        
+        self.lower_bounds = nn.ParameterList([
+            nn.Parameter(torch.ones(depths[i], dims[i]))
+            for i in range(num_stage)
+        ])
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -1008,7 +1023,15 @@ class MetaFormer(nn.Module):
     def forward_features(self, x):
         for i in range(self.num_stage):
             x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
+        #    x = self.stages[i](x)
+        #return self.norm(x.mean([1, 2])) # (B, H, W, C) -> (B, C)
+        stage_lower_bounds = F.softmax(self.lower_bounds[i],dim=0,)
+        lower_bound = x.new_zeros(x.shape[-1])
+        for j, block in enumerate(self.stages[i]):
+            # lower_bound has shape [dims[i]]
+            x = block(x, lower_bound=lower_bound)
+            # The next block receives the accumulated value.
+            lower_bound = lower_bound + stage_lower_bounds[j]
         return self.norm(x.mean([1, 2])) # (B, H, W, C) -> (B, C)
 
     def forward(self, x):
