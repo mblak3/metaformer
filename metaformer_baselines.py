@@ -31,8 +31,9 @@ from fusedbitnet import FusedBitLinear as BitLinear
 
 # For HGRN2 code
 from hgru2_pytorch.modules.hgru2_2d_series import Hgru2_2d_series
+from hgru2_pytorch.helpers import get_activation_fn, print_params
 import torch.distributed as dist
-import logging
+#import logging
 
 from einops import rearrange, repeat
 # Added Cache, what does it do?
@@ -718,52 +719,6 @@ class MinimalHGRNChannelMixer(nn.Module):
 # HGRN2 Code                 #
 ##############################
 
-def is_dist_avail_and_initialized():
-    if not dist.is_available():
-        return False
-    if not dist.is_initialized():
-        return False
-    return True
-
-def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
-
-def is_main_process():
-    return get_rank() == 0
-
-def get_activation_fn(activation):
-    if activation == "gelu":
-        return F.gelu
-    elif activation == "relu":
-        return F.relu
-    elif activation == "elu":
-        return F.elu
-    elif activation == "sigmoid":
-        return F.sigmoid
-    elif activation == "exp":
-        return torch.exp
-    elif activation == "leak":
-        return F.leaky_relu
-    elif activation == "1+elu":
-        def f(x):
-            return 1 + F.elu(x)
-        return f
-    elif activation == "silu":
-        return F.silu
-    else:
-        return lambda x: x
-
-def print_params(**kwargs):
-    if is_main_process():
-        logging.info(f"start print config of {kwargs['__class__']}")
-        for key in kwargs:
-            if key in ["__class__", "self"]:
-                continue
-            logging.info(f"{key}: {kwargs[key]}")
-        logging.info(f"end print config of {kwargs['__class__']}")
-
 
 class GLU(nn.Module):
     def __init__(self, d1, d2, act_fun, fina_act="None", dropout=0.0, bias=True):
@@ -771,7 +726,7 @@ class GLU(nn.Module):
         # get local varables
         params = locals()
         # print params
-        print_params(**params)
+        #print_params(**params) # Metaformer has it's own logging, so removing this.
         
         self.l1 = nn.Linear(d1, d2, bias=bias)
         self.l2 = nn.Linear(d1, d2, bias=bias)
@@ -794,21 +749,6 @@ class GLU(nn.Module):
 
         return output
 
-class HGRN2(nn.Module):
-    # Wrapper for Hgru2_2d_series
-    def __init__(
-        self, 
-        dim,
-        expand
-    ):
-        super().__init__()
-        self._hgrn2 = Hgru2_2d_series()
-
-    def foward(self):
-        output = self._hgrn2()
-        return output
-    
-
 ##############################
 # End                        #
 ##############################
@@ -828,13 +768,11 @@ class MetaFormerBlock(nn.Module):
         super().__init__()
 
         #self.norm1 = norm_layer(dim)
-        #print("token mixer: ")
-        #print(token_mixer)
         if token_mixer == Hgru2_2d_series:
-            #print("tokenmixer1")
+            print("token mixer1: ", token_mixer)
             self.token_mixer = token_mixer(embed_dim=dim, expand_ratio=1)
         else:
-            #print("tokenmixer2")
+            print("token mixer2: ", token_mixer)
             self.token_mixer = token_mixer(dim=dim, layer_idx=layer_idx, drop=drop)
         #self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
@@ -844,15 +782,13 @@ class MetaFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         #self.norm2 = norm_layer(dim) 
-        #print("channel mixer: ")
-        #print(mlp)
         if mlp == GLU:
-            #print("mlp1")
+            print("mlp1: ", mlp)
             self.mlp = mlp(d1=dim, d2= 3 * dim, act_fun="silu") #, drop=drop)
         else:
             #if mlp == MinimalHGRNChannelMixer:
             #    print("MinimalHGRNChannelMixer")
-            #print("mlp2")
+            print("mlp2: ", mlp)
             self.mlp = mlp(dim=dim, drop=drop)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale2 = Scale(dim=dim, init_value=layer_scale_init_value) \
