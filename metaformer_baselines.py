@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 # For Triton code
 import recurrent_fuse
-import activations
+from activations import swiglu, swiglu_linear
 import fused_norm_gate
 import layernorm
 from fusedbitnet import FusedBitLinear as BitLinear
@@ -508,10 +508,10 @@ class MatMulFreeGRU(nn.Module):
 
         f = f.sigmoid() # how does this work
 
-        # TODO: June 24 NEED TO TEST IF THIS IS USED AT ALL 
         if lower_bound is not None and self.layer_idx > 0:
             f = lower_bound + (1 - lower_bound) * f # changed F to f, was probably a typo but not sure if this code was ever run.
-        i = activations.swiglu(i, 1 - f) # need to implement 
+        #i = activations.swiglu(i, 1 - f) # need to implement 
+        i = swiglu(i, 1 - f)
 
         #print("x shape:", x.shape)
         #print("i shape:", i.shape)
@@ -664,10 +664,10 @@ class MinimalHGRNChannelMixer(nn.Module):
     """
 
     def __init__(self, dim: int, hidden_ratio: Optional[int] = 4, intermediate_size: Optional[int] = None,
-        hidden_act: str = "swish", linear_cls = BitLinear, drop: float = 0.0):
+        hidden_act: str = "swish", drop: float = 0.0):
         super().__init__()
         self.dim = dim
-        self.drop = float(drop)             # kept for BC
+        self.drop = float(drop) # kept for BC
         # Match defaults/logic from the original:
         if hidden_ratio is None:
             hidden_ratio = 4
@@ -680,8 +680,8 @@ class MinimalHGRNChannelMixer(nn.Module):
         self.intermediate_size = intermediate_size
 
         # GateProj produces 2 * intermediate_size, then we split
-        self.gate_proj = linear_cls(dim, 2 * intermediate_size, bias=False)
-        self.down_proj = linear_cls(intermediate_size, dim, bias=False)
+        self.gate_proj = BitLinear(dim, 2 * intermediate_size, bias=False)
+        self.down_proj = BitLinear(intermediate_size, dim, bias=False)
 
         self.act_fn = ACT2FN[hidden_act]
 
@@ -697,16 +697,18 @@ class MinimalHGRNChannelMixer(nn.Module):
     #     # Same structure used in the repo: swiglu(gate, y) = SiLU(gate) * y
     #     return F.silu(gate) * y
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
         x: (B, L, dim)
         returns: (B, L, dim)
         """
-        h = self.gate_proj(x)                        # (B,L,2*I)
-        gate, y = h.chunk(2, dim=-1)                # (B,L,I), (B,L,I)
-        z = activations.swiglu(gate, y)                   # (B,L,I)
-        out = self.down_proj(z)                     # (B,L,dim)
-        return out
+        #h = self.gate_proj(x)                        # (B,L,2*I)
+        #gate, y = h.chunk(2, dim=-1)                # (B,L,I), (B,L,I)
+        #z = activations.swiglu(gate, y)                   # (B,L,I)
+        #out = self.down_proj(z)                     # (B,L,dim)
+        y = self.gate_proj(x)
+        gate, y = y.chunk(2, -1)
+        return swiglu_linear(gate, y, self.down_proj.weight, self.down_proj.bias)
 
 ##############################
 # End                        #
@@ -819,7 +821,8 @@ class MetaFormerBlock(nn.Module):
                  token_mixer=nn.Identity, mlp=GLU,
                  norm_layer=nn.LayerNorm,
                  drop=0., drop_path=0.,
-                 layer_scale_init_value=None, res_scale_init_value=None
+                 layer_scale_init_value=None, res_scale_init_value=None,
+                 layer_idx = 0,
                  ):
 
         super().__init__()
@@ -832,7 +835,7 @@ class MetaFormerBlock(nn.Module):
             self.token_mixer = token_mixer(embed_dim=dim, expand_ratio=1)
         else:
             #print("tokenmixer2")
-            self.token_mixer = token_mixer(dim=dim, drop=drop)
+            self.token_mixer = token_mixer(dim=dim, layer_idx=layer_idx, drop=drop)
         #self.token_mixer = token_mixer(dim=dim, drop=drop) 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity() 
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
@@ -991,6 +994,7 @@ class MetaFormer(nn.Module):
                 drop_path=dp_rates[cur + j],
                 layer_scale_init_value=layer_scale_init_values[i],
                 res_scale_init_value=res_scale_init_values[i],
+                layer_idx=j,
                 ) for j in range(depths[i])]
             )
             self.stages.append(stage)
